@@ -1117,7 +1117,7 @@ fn supervised_container_command_with_pid_file(
     command: &str,
     pid_file: &str,
 ) -> String {
-    let quoted_pid_file = crate::remote_ssh::shell::quote_arg(&pid_file);
+    let quoted_pid_file = crate::remote_ssh::shell::quote_arg(pid_file);
     let quoted_command = crate::remote_ssh::shell::quote_arg(command);
     let quoted_shell = crate::remote_ssh::shell::quote_arg(&container.shell);
     let sweep = stale_pid_file_sweep();
@@ -3324,6 +3324,13 @@ impl SSHConnectionManager {
                 }
                 Some(russh::ChannelMsg::ExitSignal { signal_name, .. }) => {
                     interrupted = interrupted || matches!(signal_name, Sig::INT | Sig::TERM);
+                    // A signal death is still a resolved status. Without this the
+                    // result fell through to the unknown `-1` below.
+                    if exit_status.is_none() {
+                        exit_status = crate::remote_ssh::transport::ssh_exit_code_for_signal(
+                            &signal_name,
+                        );
+                    }
                     log::debug!(
                         "Remote exec exit signal received: signal={:?}, stdout_len={}, stderr_len={}, duration_ms={}, command_preview={}",
                         signal_name,
@@ -5604,7 +5611,7 @@ mod tests {
     #[test]
     fn parses_container_directory_entry_with_newline_and_unit_separator() {
         let entries = parse_container_dir_output(
-            "src\n\u{1f}name\0/workspace/src\n\u{1f}name\0d\0\01720000000\0755\0",
+            "src\n\u{1f}name\x00/workspace/src\n\u{1f}name\x00d\x00\x001720000000\x00755\x00",
         )
         .unwrap();
         let entry = &entries[0];

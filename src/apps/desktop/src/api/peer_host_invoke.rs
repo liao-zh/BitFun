@@ -100,6 +100,7 @@ static LOCAL_ONLY_COMMANDS: &[&str] = &[
     "dispatch_install_cli_start",
     "dispatch_install_cli_poll",
     "dispatch_install_cli_cancel",
+    "dispatch_sync_model_config",
     "dispatch_submit",
     "dispatch_status",
     "dispatch_cancel",
@@ -168,7 +169,7 @@ struct HostInvokeBridgeRequest {
 }
 
 pub fn is_local_only_command(command: &str) -> bool {
-    LOCAL_ONLY_COMMANDS.iter().any(|denied| *denied == command)
+    LOCAL_ONLY_COMMANDS.contains(&command)
 }
 
 /// Register a controller device id to receive peer UI events.
