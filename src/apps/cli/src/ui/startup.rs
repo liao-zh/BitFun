@@ -1068,7 +1068,7 @@ impl StartupPage {
             ActionHandler::NavigateBack => self.navigate_back(),
             ActionHandler::ClearConversation
             | ActionHandler::RenameSession
-            | ActionHandler::ReloadSkills
+            | ActionHandler::Reload
             | ActionHandler::Tools
             | ActionHandler::Extensions
             | ActionHandler::NativeHooks
@@ -1397,17 +1397,10 @@ impl StartupPage {
             })
             .collect();
 
-        self.session_selector
-            .show(session_items, None, !self.agent.is_shared());
+        self.session_selector.show(session_items, None, true);
     }
 
     fn handle_session_delete(&mut self, item: &SessionItem) {
-        if self.agent.is_shared() {
-            self.status = Some(format!(
-                "Session deletion is unavailable in Shared TUI preview. {SHARED_TUI_EMBEDDED_HANDOFF}; then run `bitfun sessions delete`"
-            ));
-            return;
-        }
         let agent = Arc::clone(&self.agent);
         let sid = item.session_id.clone();
 

@@ -18,11 +18,12 @@ mod tests {
         merge_external_agent_mutation_snapshot, native_command_choice_is_active,
         native_command_reconfirmation_is_required, native_hook_help_text,
         parse_external_agent_review_action, parse_external_control_action,
-        parse_external_tool_review_action, parse_hook_management_action,
-        pending_session_update_blocks_runtime_action, previous_session_update_status,
-        render_external_hook_catalog, render_native_hook_overview, requested_session_name,
-        retain_selected_native_command_for_input, selected_command_prefill,
-        session_command_help_note, session_update_allowed, session_update_blocks_typed_submission,
+        parse_external_tool_review_action, parse_hook_management_action, parse_reload_invocation,
+        parse_reload_target, pending_session_operation_blocks_runtime_action,
+        previous_session_update_status, render_external_hook_catalog, render_native_hook_overview,
+        requested_session_name, retain_selected_native_command_for_input, selected_command_prefill,
+        session_command_help_note, session_delete_allowed, session_delete_feedback,
+        session_update_allowed, session_update_blocks_typed_submission,
         session_update_completion_should_exit, shared_session_change_is_blocked, CommandRoute,
         ExternalAgentReviewAction, ExternalControlUiAction, ExternalSourceConflictPreferences,
         ExternalToolReviewAction, HookManagementAction, SessionUpdateApplyOutcome,
@@ -48,7 +49,37 @@ mod tests {
         NativeHookFileView, NativeHookHandlerView, NativeHookOverview, NativeHookRuleView,
     };
     use bitfun_product_domains::external_sources::ExternalSourceScope;
+    use bitfun_runtime_ports::AgentContextReloadTarget;
     use std::collections::{BTreeMap, BTreeSet};
+
+    #[test]
+    fn reload_command_uses_one_closed_optional_target() {
+        assert_eq!(
+            parse_reload_target("").unwrap(),
+            AgentContextReloadTarget::All
+        );
+        assert_eq!(
+            parse_reload_target(" SKILLS ").unwrap(),
+            AgentContextReloadTarget::Skills
+        );
+        assert_eq!(
+            parse_reload_target("Instructions").unwrap(),
+            AgentContextReloadTarget::Instructions
+        );
+        assert!(parse_reload_target("mcp").is_err());
+        assert!(parse_reload_target("skills instructions").is_err());
+
+        assert_eq!(
+            parse_reload_invocation("reload-skills", "")
+                .unwrap()
+                .unwrap(),
+            AgentContextReloadTarget::Skills
+        );
+        assert!(parse_reload_invocation("reload-skills", "instructions")
+            .unwrap()
+            .is_err());
+        assert!(parse_reload_invocation("other", "").is_none());
+    }
 
     fn external_command(
         name: &str,
@@ -1558,44 +1589,93 @@ mod tests {
     }
 
     #[test]
-    fn pending_session_update_routes_commands_to_their_action_guards() {
+    fn shared_session_delete_is_available_only_when_idle_and_no_operation_is_pending() {
+        assert!(session_delete_allowed(false, true, false, false));
+        assert!(!session_delete_allowed(true, true, false, false));
+        assert!(!session_delete_allowed(false, true, true, false));
+        assert!(!session_delete_allowed(false, true, false, true));
+
+        // Embedded deletion keeps its existing ability to delete another
+        // Session while the current Session is running a Turn.
+        assert!(session_delete_allowed(false, false, true, false));
+    }
+
+    #[test]
+    fn session_delete_removes_the_item_only_after_runtime_confirmation() {
+        let (remove, status) = session_delete_feedback(
+            "Old session",
+            &SessionUpdateApplyOutcome::SessionUpdateFailed("session in use".to_string()),
+        );
+        assert!(!remove);
+        assert!(status.contains("session in use"));
+
+        let (remove, status) =
+            session_delete_feedback("Old session", &SessionUpdateApplyOutcome::Applied);
+        assert!(remove);
+        assert_eq!(status, "Session deleted: Old session");
+
+        let (remove, status) = session_delete_feedback(
+            "Old session",
+            &SessionUpdateApplyOutcome::OutcomeUnknown("request timed out".to_string()),
+        );
+        assert!(!remove);
+        assert!(status.contains("unknown outcome"));
+        assert!(status.contains("closing"));
+    }
+
+    #[test]
+    fn chat_session_delete_reuses_the_existing_async_session_slot() {
+        let source = include_str!("sessions.rs").replace("\r\n", "\n");
+        let delete = source
+            .split_once("fn handle_session_delete(")
+            .expect("delete handler")
+            .1;
+
+        assert!(delete.contains("rt_handle.spawn"));
+        assert!(delete.contains("pending_session_operation = Some(PendingSessionOperation"));
+        assert!(!delete.contains("block_in_place"));
+        assert!(!source.contains("PendingSessionDelete"));
+    }
+
+    #[test]
+    fn pending_session_operation_routes_commands_to_their_action_guards() {
         assert!(session_update_blocks_typed_submission(true, "continue"));
         assert!(!session_update_blocks_typed_submission(true, "/new"));
         assert!(!session_update_blocks_typed_submission(true, "/sessions"));
         assert!(!session_update_blocks_typed_submission(true, "/exit"));
         assert!(!session_update_blocks_typed_submission(false, "continue"));
 
-        assert!(pending_session_update_blocks_runtime_action(
+        assert!(pending_session_operation_blocks_runtime_action(
             true,
             true,
             ActionHandler::Sessions,
         ));
-        assert!(pending_session_update_blocks_runtime_action(
+        assert!(pending_session_operation_blocks_runtime_action(
             true,
             true,
             ActionHandler::Init,
         ));
-        assert!(pending_session_update_blocks_runtime_action(
+        assert!(pending_session_operation_blocks_runtime_action(
             true,
             true,
             ActionHandler::RenameSession,
         ));
-        assert!(!pending_session_update_blocks_runtime_action(
+        assert!(!pending_session_operation_blocks_runtime_action(
             true,
             true,
             ActionHandler::Exit,
         ));
-        assert!(!pending_session_update_blocks_runtime_action(
+        assert!(!pending_session_operation_blocks_runtime_action(
             true,
             true,
             ActionHandler::OpenAgentSelector,
         ));
-        assert!(!pending_session_update_blocks_runtime_action(
+        assert!(!pending_session_operation_blocks_runtime_action(
             false,
             true,
             ActionHandler::Sessions,
         ));
-        assert!(!pending_session_update_blocks_runtime_action(
+        assert!(!pending_session_operation_blocks_runtime_action(
             true,
             false,
             ActionHandler::Sessions,
@@ -1698,6 +1778,7 @@ mod tests {
         assert!(SHARED_TUI_CHAT_STATUS.contains("current Session Agent mode"));
         assert!(SHARED_TUI_CHAT_STATUS.contains("current Session model"));
         assert!(SHARED_TUI_CHAT_STATUS.contains("current Session name"));
+        assert!(SHARED_TUI_CHAT_STATUS.contains("/reload [skills|instructions]"));
         assert!(SHARED_TUI_CHAT_STATUS.contains("Agent/Subagent management"));
         assert!(SHARED_TUI_CHAT_STATUS.contains("model management remains Embedded"));
     }
