@@ -40,6 +40,8 @@ export interface DispatchObserverJob {
   approvalPolicy: DispatchApprovalPolicy;
   workspaceDelivery: DispatchWorkspaceDeliveryRequest;
   model?: string;
+  availableModels?: string[];
+  defaultModel?: string;
   cursor: number;
   state: DispatchJobState;
   terminalDrained?: boolean;
@@ -68,10 +70,7 @@ interface DispatchJobStoreState {
   /** Local projection tombstones. The target job remains durable, but must not reopen in navigation. */
   dismissedJobIds: string[];
   registerJob: (job: DispatchObserverJob) => void;
-  mergeOutboundRecords: (
-    records: OutboundDispatchRecord[],
-    fallbackSourceWorkspacePath?: string,
-  ) => void;
+  mergeOutboundRecords: (records: OutboundDispatchRecord[]) => void;
   updateProgress: (
     jobId: string,
     update: {
@@ -95,6 +94,8 @@ interface DispatchJobStoreState {
   ) => void;
   resetReplay: (jobId: string) => void;
   updateTitle: (jobId: string, title: string) => void;
+  updateModel: (jobId: string, model: string) => void;
+  updateApprovalPolicy: (jobId: string, policy: DispatchApprovalPolicy) => void;
   dismissJob: (jobId: string) => void;
   removeJob: (jobId: string) => void;
   clear: () => void;
@@ -159,11 +160,37 @@ export const useDispatchJobStore = create<DispatchJobStoreState>()(
         });
       },
 
-      mergeOutboundRecords: (records, fallbackSourceWorkspacePath) => {
+      mergeOutboundRecords: (records) => {
         set(state => {
           const jobs = { ...state.jobs };
+          const authoritativeJobIds = new Set(records.map(record => record.jobId));
+          const prunedJobIds = new Set<string>();
+          for (const [jobId, job] of Object.entries(jobs)) {
+            if (
+              !authoritativeJobIds.has(jobId)
+              && job.state !== 'submitting'
+              && job.state !== 'submission_unknown'
+            ) {
+              // The controller index is authoritative after acknowledgement.
+              // Remove renderer cache left behind by retention, manual cleanup,
+              // or an older build instead of restoring a ghost projection.
+              delete jobs[jobId];
+              prunedJobIds.add(jobId);
+            }
+          }
           for (const record of records) {
             if (state.dismissedJobIds.includes(record.jobId)) {
+              continue;
+            }
+            const sourceWorkspacePath = record.sourceWorkspacePath?.trim() || undefined;
+            if (!sourceWorkspacePath) {
+              // A legacy/adopted record without controller-side ownership
+              // cannot safely be projected into any workspace. In particular,
+              // never assign it to whichever workspace happened to initialize
+              // first after restart. Remove any previously inferred cache
+              // entry so the old behavior migrates itself away.
+              delete jobs[record.jobId];
+              prunedJobIds.add(record.jobId);
               continue;
             }
             const existing = jobs[record.jobId];
@@ -174,6 +201,11 @@ export const useDispatchJobStore = create<DispatchJobStoreState>()(
                 ...existing,
                 target: record.target,
                 targetRequest: requestFromTarget(record.target),
+                // The durable outbound record is the only authority allowed
+                // to restore a projection after renderer restart.
+                sourceWorkspacePath,
+                sourceWorkspaceId:
+                  record.sourceWorkspaceId || existing.sourceWorkspaceId,
                 title: record.title || existing.title,
                 agentType: record.agentType || existing.agentType,
                 approvalPolicy: record.approvalPolicy || existing.approvalPolicy,
@@ -193,7 +225,8 @@ export const useDispatchJobStore = create<DispatchJobStoreState>()(
               sessionId: record.sessionId,
               targetRequest: requestFromTarget(record.target),
               target: record.target,
-              sourceWorkspacePath: fallbackSourceWorkspacePath,
+              sourceWorkspacePath,
+              sourceWorkspaceId: record.sourceWorkspaceId,
               title: record.title || record.promptPreview || record.sessionId.slice(0, 8),
               agentType: record.agentType || 'agentic',
               approvalPolicy: record.approvalPolicy || 'reject-and-report',
@@ -214,6 +247,9 @@ export const useDispatchJobStore = create<DispatchJobStoreState>()(
             };
           }
           const transportByJobId = { ...state.transportByJobId };
+          for (const jobId of prunedJobIds) {
+            delete transportByJobId[jobId];
+          }
           for (const jobId of Object.keys(jobs)) {
             transportByJobId[jobId] ??= { reachability: 'unknown' };
           }
@@ -319,6 +355,45 @@ export const useDispatchJobStore = create<DispatchJobStoreState>()(
               [jobId]: {
                 ...current,
                 title: normalizedTitle,
+                updatedAt: Date.now(),
+              },
+            },
+          };
+        });
+      },
+
+      updateModel: (jobId, model) => {
+        set(state => {
+          const current = state.jobs[jobId];
+          const normalizedModel = model.trim();
+          if (!current || !normalizedModel || current.model === normalizedModel) {
+            return state;
+          }
+          return {
+            jobs: {
+              ...state.jobs,
+              [jobId]: {
+                ...current,
+                model: normalizedModel,
+                updatedAt: Date.now(),
+              },
+            },
+          };
+        });
+      },
+
+      updateApprovalPolicy: (jobId, approvalPolicy) => {
+        set(state => {
+          const current = state.jobs[jobId];
+          if (!current || current.approvalPolicy === approvalPolicy) {
+            return state;
+          }
+          return {
+            jobs: {
+              ...state.jobs,
+              [jobId]: {
+                ...current,
+                approvalPolicy,
                 updatedAt: Date.now(),
               },
             },

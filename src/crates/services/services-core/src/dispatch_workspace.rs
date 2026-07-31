@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 use tar::{Archive, Builder, EntryType, Header};
 
 pub const WORKSPACE_SNAPSHOT_FORMAT_VERSION: u32 = 1;
+pub const WORKSPACE_SNAPSHOT_SOURCE_FINGERPRINT_VERSION: u32 = 1;
 pub const MAX_SNAPSHOT_FILES: u64 = 100_000;
 pub const MAX_SNAPSHOT_DIRECTORIES: u64 = 100_000;
 pub const MAX_SNAPSHOT_FILE_BYTES: u64 = 256 * 1024 * 1024;
@@ -69,6 +70,45 @@ pub struct WorkspaceSnapshotMetadata {
     pub file_count: u64,
     pub directory_count: u64,
     pub uncompressed_bytes: u64,
+}
+
+/// Cheaply recomputable state of the source tree used to create a snapshot.
+///
+/// This is a controller-local cache key, not part of the target wire metadata.
+/// It covers the selected portable paths plus file identity, size, write/change
+/// timestamps, and executable state without rereading file contents.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkspaceSnapshotSourceFingerprint {
+    pub format_version: u32,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedWorkspaceSnapshot {
+    pub metadata: WorkspaceSnapshotMetadata,
+    pub source_fingerprint: WorkspaceSnapshotSourceFingerprint,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkspaceSnapshotCaptureMode {
+    Source,
+    Exact,
+}
+
+impl WorkspaceSnapshotCaptureMode {
+    fn manifest_mode(self) -> &'static str {
+        // The transport envelope remains the existing exact-snapshot contract:
+        // source filtering happens while the controller captures the input set,
+        // then that complete captured set is signed and transferred exactly.
+        "exact"
+    }
+
+    fn includes_ignored_files(self) -> bool {
+        // True relative to the captured input set. Source mode has already
+        // removed ignored paths before the manifest is constructed.
+        true
+    }
 }
 
 /// What the target changed, relative to the snapshot it was given.
@@ -220,7 +260,12 @@ pub fn create_workspace_result_bundle(
         ..summary.clone()
     })
     .context("encode dispatch result summary")?;
-    append_bytes(&mut archive, RESULT_SUMMARY_ARCHIVE_PATH, &summary_bytes, false)?;
+    append_bytes(
+        &mut archive,
+        RESULT_SUMMARY_ARCHIVE_PATH,
+        &summary_bytes,
+        false,
+    )?;
 
     archive
         .into_inner()
@@ -357,8 +402,7 @@ pub fn apply_workspace_result_bundle(
         }
         let destination = resolve_workspace_child(&workspace, &relative_wire)?;
         if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
         }
         let mut bytes = Vec::new();
         entry
@@ -409,17 +453,65 @@ pub fn create_exact_workspace_snapshot(
     source: &Path,
     archive_path: &Path,
 ) -> Result<WorkspaceSnapshotMetadata> {
-    let result = create_exact_workspace_snapshot_inner(source, archive_path);
+    Ok(prepare_exact_workspace_snapshot(source, archive_path)?.metadata)
+}
+
+pub fn prepare_exact_workspace_snapshot(
+    source: &Path,
+    archive_path: &Path,
+) -> Result<PreparedWorkspaceSnapshot> {
+    create_workspace_snapshot(source, archive_path, WorkspaceSnapshotCaptureMode::Exact)
+}
+
+/// Package workspace source while honoring repository ignore rules.
+///
+/// Hidden source files remain eligible (for example `.github/workflows`), but
+/// ignored dependency caches and build output are not transferred. Callers
+/// that need byte-for-byte workspace contents must use the explicit exact
+/// snapshot path instead.
+pub fn create_source_workspace_snapshot(
+    source: &Path,
+    archive_path: &Path,
+) -> Result<WorkspaceSnapshotMetadata> {
+    Ok(prepare_source_workspace_snapshot(source, archive_path)?.metadata)
+}
+
+pub fn prepare_source_workspace_snapshot(
+    source: &Path,
+    archive_path: &Path,
+) -> Result<PreparedWorkspaceSnapshot> {
+    create_workspace_snapshot(source, archive_path, WorkspaceSnapshotCaptureMode::Source)
+}
+
+pub fn exact_workspace_snapshot_source_fingerprint(
+    source: &Path,
+) -> Result<WorkspaceSnapshotSourceFingerprint> {
+    workspace_snapshot_source_fingerprint(source, WorkspaceSnapshotCaptureMode::Exact)
+}
+
+pub fn source_workspace_snapshot_source_fingerprint(
+    source: &Path,
+) -> Result<WorkspaceSnapshotSourceFingerprint> {
+    workspace_snapshot_source_fingerprint(source, WorkspaceSnapshotCaptureMode::Source)
+}
+
+fn create_workspace_snapshot(
+    source: &Path,
+    archive_path: &Path,
+    capture_mode: WorkspaceSnapshotCaptureMode,
+) -> Result<PreparedWorkspaceSnapshot> {
+    let result = create_workspace_snapshot_inner(source, archive_path, capture_mode);
     if result.is_err() {
         let _ = fs::remove_file(archive_path);
     }
     result
 }
 
-fn create_exact_workspace_snapshot_inner(
+fn create_workspace_snapshot_inner(
     source: &Path,
     archive_path: &Path,
-) -> Result<WorkspaceSnapshotMetadata> {
+    capture_mode: WorkspaceSnapshotCaptureMode,
+) -> Result<PreparedWorkspaceSnapshot> {
     let source_metadata = fs::symlink_metadata(source)
         .with_context(|| format!("inspect workspace {}", source.display()))?;
     if source_metadata.file_type().is_symlink() || !source_metadata.is_dir() {
@@ -447,25 +539,12 @@ fn create_exact_workspace_snapshot_inner(
     let mut archive = Builder::new(encoder);
     archive.mode(tar::HeaderMode::Deterministic);
 
-    let mut walk = WalkBuilder::new(&source);
-    walk.hidden(false)
-        .ignore(false)
-        .git_ignore(false)
-        .git_global(false)
-        .git_exclude(false)
-        .parents(false)
-        .follow_links(false)
-        .sort_by_file_path(|left, right| left.cmp(right));
-    let filter_root = source.clone();
-    walk.filter_entry(move |entry| {
-        entry.path() == filter_root || entry.file_name().to_str() != Some(".git")
-    });
-
     let mut entries = Vec::new();
     let mut file_count = 0_u64;
     let mut directory_count = 0_u64;
     let mut uncompressed_bytes = 0_u64;
-    for walked in walk.build() {
+    let mut source_fingerprint = new_source_fingerprint(capture_mode);
+    for walked in workspace_walk(&source, capture_mode) {
         let walked = walked.context("walk workspace for dispatch snapshot")?;
         let path = walked.path();
         if path == source {
@@ -492,6 +571,7 @@ fn create_exact_workspace_snapshot_inner(
                 );
             }
             append_directory(&mut archive, &relative_wire)?;
+            update_directory_source_fingerprint(&mut source_fingerprint, &relative_wire);
             entries.push(WorkspaceSnapshotEntry {
                 path: relative_wire,
                 kind: WorkspaceSnapshotEntryKind::Directory,
@@ -530,6 +610,12 @@ fn create_exact_workspace_snapshot_inner(
             );
         }
         let executable = is_executable(&metadata);
+        update_file_source_fingerprint(
+            &mut source_fingerprint,
+            &relative_wire,
+            &metadata,
+            executable,
+        )?;
         let sha256 = append_file(&mut archive, path, &relative_wire, &metadata, executable)?;
         entries.push(WorkspaceSnapshotEntry {
             path: relative_wire,
@@ -542,8 +628,8 @@ fn create_exact_workspace_snapshot_inner(
 
     let manifest = WorkspaceSnapshotManifest {
         format_version: WORKSPACE_SNAPSHOT_FORMAT_VERSION,
-        mode: "exact".to_string(),
-        includes_ignored_files: true,
+        mode: capture_mode.manifest_mode().to_string(),
+        includes_ignored_files: capture_mode.includes_ignored_files(),
         excludes_git_metadata: true,
         file_count,
         directory_count,
@@ -579,15 +665,221 @@ fn create_exact_workspace_snapshot_inner(
         );
     }
     let archive_sha256 = sha256_file(archive_path)?;
-    Ok(WorkspaceSnapshotMetadata {
-        format_version: WORKSPACE_SNAPSHOT_FORMAT_VERSION,
-        archive_size,
-        archive_sha256,
-        manifest_sha256,
-        file_count,
-        directory_count,
-        uncompressed_bytes,
+    Ok(PreparedWorkspaceSnapshot {
+        metadata: WorkspaceSnapshotMetadata {
+            format_version: WORKSPACE_SNAPSHOT_FORMAT_VERSION,
+            archive_size,
+            archive_sha256,
+            manifest_sha256,
+            file_count,
+            directory_count,
+            uncompressed_bytes,
+        },
+        source_fingerprint: finish_source_fingerprint(source_fingerprint),
     })
+}
+
+fn workspace_snapshot_source_fingerprint(
+    source: &Path,
+    capture_mode: WorkspaceSnapshotCaptureMode,
+) -> Result<WorkspaceSnapshotSourceFingerprint> {
+    let source_metadata = fs::symlink_metadata(source)
+        .with_context(|| format!("inspect workspace {}", source.display()))?;
+    if source_metadata.file_type().is_symlink() || !source_metadata.is_dir() {
+        bail!(
+            "workspace snapshot source is not a real directory: {}",
+            source.display()
+        );
+    }
+    let source = source
+        .canonicalize()
+        .with_context(|| format!("resolve workspace {}", source.display()))?;
+    let mut fingerprint = new_source_fingerprint(capture_mode);
+    let mut file_count = 0_u64;
+    let mut directory_count = 0_u64;
+    let mut uncompressed_bytes = 0_u64;
+    for walked in workspace_walk(&source, capture_mode) {
+        let walked = walked.context("walk workspace for dispatch snapshot fingerprint")?;
+        let path = walked.path();
+        if path == source {
+            continue;
+        }
+        let relative = path
+            .strip_prefix(&source)
+            .with_context(|| format!("resolve snapshot path {}", path.display()))?;
+        let relative_wire = portable_relative_path(relative)?;
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("inspect snapshot entry {}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            bail!(
+                "workspace snapshot does not support symbolic link '{}'",
+                relative_wire
+            );
+        }
+        if metadata.is_dir() {
+            directory_count = directory_count.saturating_add(1);
+            if directory_count > MAX_SNAPSHOT_DIRECTORIES {
+                bail!(
+                    "workspace snapshot exceeds the {} directory limit",
+                    MAX_SNAPSHOT_DIRECTORIES
+                );
+            }
+            update_directory_source_fingerprint(&mut fingerprint, &relative_wire);
+            continue;
+        }
+        if !metadata.is_file() {
+            bail!(
+                "workspace snapshot contains unsupported special file '{}'",
+                relative_wire
+            );
+        }
+        if metadata.len() > MAX_SNAPSHOT_FILE_BYTES {
+            bail!(
+                "workspace snapshot file '{}' exceeds the {} MiB per-file limit",
+                relative_wire,
+                MAX_SNAPSHOT_FILE_BYTES / (1024 * 1024)
+            );
+        }
+        file_count = file_count.saturating_add(1);
+        if file_count > MAX_SNAPSHOT_FILES {
+            bail!(
+                "workspace snapshot exceeds the {} file limit",
+                MAX_SNAPSHOT_FILES
+            );
+        }
+        uncompressed_bytes = uncompressed_bytes.saturating_add(metadata.len());
+        if uncompressed_bytes > MAX_SNAPSHOT_UNCOMPRESSED_BYTES {
+            bail!(
+                "workspace snapshot exceeds the {} MiB uncompressed limit",
+                MAX_SNAPSHOT_UNCOMPRESSED_BYTES / (1024 * 1024)
+            );
+        }
+        update_file_source_fingerprint(
+            &mut fingerprint,
+            &relative_wire,
+            &metadata,
+            is_executable(&metadata),
+        )?;
+    }
+    Ok(finish_source_fingerprint(fingerprint))
+}
+
+fn workspace_walk(source: &Path, capture_mode: WorkspaceSnapshotCaptureMode) -> ignore::Walk {
+    let mut walk = WalkBuilder::new(source);
+    walk.hidden(false).follow_links(false);
+    match capture_mode {
+        WorkspaceSnapshotCaptureMode::Source => {
+            walk.ignore(true)
+                .git_ignore(true)
+                .git_global(true)
+                .git_exclude(true)
+                .require_git(false)
+                .parents(false);
+        }
+        WorkspaceSnapshotCaptureMode::Exact => {
+            walk.ignore(false)
+                .git_ignore(false)
+                .git_global(false)
+                .git_exclude(false)
+                .parents(false);
+        }
+    }
+    walk.sort_by_file_path(|left, right| left.cmp(right));
+    let filter_root = source.to_path_buf();
+    walk.filter_entry(move |entry| {
+        entry.path() == filter_root || entry.file_name().to_str() != Some(".git")
+    });
+    walk.build()
+}
+
+fn new_source_fingerprint(capture_mode: WorkspaceSnapshotCaptureMode) -> Sha256 {
+    let mut fingerprint = Sha256::new();
+    fingerprint.update(b"bitfun-dispatch-workspace-source-fingerprint");
+    fingerprint.update(WORKSPACE_SNAPSHOT_SOURCE_FINGERPRINT_VERSION.to_le_bytes());
+    fingerprint.update(match capture_mode {
+        WorkspaceSnapshotCaptureMode::Source => b"source".as_slice(),
+        WorkspaceSnapshotCaptureMode::Exact => b"exact".as_slice(),
+    });
+    fingerprint
+}
+
+fn update_directory_source_fingerprint(fingerprint: &mut Sha256, relative_wire: &str) {
+    update_fingerprint_field(fingerprint, b"directory");
+    update_fingerprint_field(fingerprint, relative_wire.as_bytes());
+}
+
+fn update_file_source_fingerprint(
+    fingerprint: &mut Sha256,
+    relative_wire: &str,
+    metadata: &fs::Metadata,
+    executable: bool,
+) -> Result<()> {
+    update_fingerprint_field(fingerprint, b"file");
+    update_fingerprint_field(fingerprint, relative_wire.as_bytes());
+    fingerprint.update(metadata.len().to_le_bytes());
+    fingerprint.update([u8::from(executable)]);
+    update_platform_file_fingerprint(fingerprint, metadata)
+}
+
+#[cfg(unix)]
+fn update_platform_file_fingerprint(
+    fingerprint: &mut Sha256,
+    metadata: &fs::Metadata,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    fingerprint.update(metadata.dev().to_le_bytes());
+    fingerprint.update(metadata.ino().to_le_bytes());
+    fingerprint.update(metadata.mode().to_le_bytes());
+    fingerprint.update(metadata.mtime().to_le_bytes());
+    fingerprint.update(metadata.mtime_nsec().to_le_bytes());
+    fingerprint.update(metadata.ctime().to_le_bytes());
+    fingerprint.update(metadata.ctime_nsec().to_le_bytes());
+    Ok(())
+}
+
+#[cfg(windows)]
+fn update_platform_file_fingerprint(
+    fingerprint: &mut Sha256,
+    metadata: &fs::Metadata,
+) -> Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    fingerprint.update(metadata.file_attributes().to_le_bytes());
+    fingerprint.update(metadata.creation_time().to_le_bytes());
+    fingerprint.update(metadata.last_write_time().to_le_bytes());
+    fingerprint.update(metadata.file_size().to_le_bytes());
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn update_platform_file_fingerprint(
+    fingerprint: &mut Sha256,
+    metadata: &fs::Metadata,
+) -> Result<()> {
+    use std::time::UNIX_EPOCH;
+    let modified = metadata
+        .modified()
+        .context("read workspace file modification time")?;
+    let (before_epoch, duration) = match modified.duration_since(UNIX_EPOCH) {
+        Ok(duration) => (false, duration),
+        Err(error) => (true, error.duration()),
+    };
+    fingerprint.update([u8::from(before_epoch)]);
+    fingerprint.update(duration.as_secs().to_le_bytes());
+    fingerprint.update(duration.subsec_nanos().to_le_bytes());
+    fingerprint.update([u8::from(metadata.permissions().readonly())]);
+    Ok(())
+}
+
+fn update_fingerprint_field(fingerprint: &mut Sha256, value: &[u8]) {
+    fingerprint.update((value.len() as u64).to_le_bytes());
+    fingerprint.update(value);
+}
+
+fn finish_source_fingerprint(fingerprint: Sha256) -> WorkspaceSnapshotSourceFingerprint {
+    WorkspaceSnapshotSourceFingerprint {
+        format_version: WORKSPACE_SNAPSHOT_SOURCE_FINGERPRINT_VERSION,
+        sha256: format!("{:x}", fingerprint.finalize()),
+    }
 }
 
 /// Verify and extract a snapshot into a brand-new staging directory.
@@ -828,9 +1120,13 @@ fn validate_manifest(
     manifest: &WorkspaceSnapshotManifest,
     expected: &WorkspaceSnapshotMetadata,
 ) -> Result<()> {
+    let compatible_capture_mode = match manifest.mode.as_str() {
+        "exact" => manifest.includes_ignored_files,
+        "source" => !manifest.includes_ignored_files,
+        _ => false,
+    };
     if manifest.format_version != WORKSPACE_SNAPSHOT_FORMAT_VERSION
-        || manifest.mode != "exact"
-        || !manifest.includes_ignored_files
+        || !compatible_capture_mode
         || !manifest.excludes_git_metadata
     {
         bail!("workspace snapshot manifest contract is incompatible");
@@ -1162,6 +1458,89 @@ mod tests {
     }
 
     #[test]
+    fn source_snapshot_keeps_hidden_source_and_excludes_ignored_build_output() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        fs::create_dir_all(source.join(".git")).expect("repository marker");
+        fs::create_dir_all(source.join(".github/workflows")).expect("hidden source directory");
+        fs::create_dir_all(source.join("target/debug")).expect("ignored build directory");
+        fs::write(source.join(".gitignore"), b"target/\n.env\n").expect("gitignore");
+        fs::write(source.join(".github/workflows/check.yml"), b"name: check")
+            .expect("hidden source file");
+        fs::write(source.join("source.rs"), b"fn main() {}").expect("source");
+        fs::write(source.join(".env"), b"SECRET=test").expect("ignored secret");
+        fs::write(source.join("target/debug/app"), b"build output").expect("build output");
+        let archive = temp.path().join("source-snapshot.tar.gz");
+
+        let metadata =
+            create_source_workspace_snapshot(&source, &archive).expect("create source snapshot");
+        let destination = temp.path().join("destination");
+        let manifest =
+            extract_workspace_snapshot(&archive, &destination, &metadata).expect("extract");
+
+        assert_eq!(manifest.mode, "exact");
+        assert!(manifest.includes_ignored_files);
+        assert_eq!(
+            fs::read(destination.join(".github/workflows/check.yml")).expect("workflow"),
+            b"name: check"
+        );
+        assert!(destination.join("source.rs").is_file());
+        assert!(destination.join(".gitignore").is_file());
+        assert!(!destination.join(".env").exists());
+        assert!(!destination.join("target").exists());
+    }
+
+    #[test]
+    fn source_fingerprint_reuses_ignored_state_and_invalidates_included_changes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        fs::create_dir_all(source.join(".git")).expect("repository marker");
+        fs::create_dir_all(source.join("target")).expect("ignored directory");
+        fs::write(source.join(".gitignore"), b"target/\n").expect("gitignore");
+        fs::write(source.join("source.rs"), b"fn main() {}").expect("source");
+        fs::write(source.join("target/app"), b"first build").expect("ignored output");
+        let archive = temp.path().join("source-snapshot.tar.gz");
+
+        let prepared =
+            prepare_source_workspace_snapshot(&source, &archive).expect("prepare source snapshot");
+        let unchanged =
+            source_workspace_snapshot_source_fingerprint(&source).expect("source fingerprint");
+        assert_eq!(prepared.source_fingerprint, unchanged);
+
+        fs::write(source.join("target/app"), b"a different ignored build")
+            .expect("change ignored output");
+        assert_eq!(
+            unchanged,
+            source_workspace_snapshot_source_fingerprint(&source)
+                .expect("fingerprint after ignored change")
+        );
+
+        let exact_before =
+            exact_workspace_snapshot_source_fingerprint(&source).expect("exact fingerprint");
+        fs::write(
+            source.join("target/app"),
+            b"another ignored build with a different size",
+        )
+        .expect("change exact input");
+        assert_ne!(
+            exact_before,
+            exact_workspace_snapshot_source_fingerprint(&source)
+                .expect("exact fingerprint after ignored change")
+        );
+
+        fs::write(
+            source.join("source.rs"),
+            b"fn main() { println!(\"changed\"); }",
+        )
+        .expect("change source");
+        assert_ne!(
+            unchanged,
+            source_workspace_snapshot_source_fingerprint(&source)
+                .expect("fingerprint after source change")
+        );
+    }
+
+    #[test]
     fn result_bundle_reports_adds_edits_and_deletes_without_git() {
         let temp = tempfile::tempdir().expect("tempdir");
         let source = temp.path().join("source");
@@ -1229,7 +1608,11 @@ mod tests {
         temp: &Path,
         seed: &[(&str, &[u8])],
         mutate: impl FnOnce(&Path),
-    ) -> (WorkspaceResultSummary, std::path::PathBuf, std::path::PathBuf) {
+    ) -> (
+        WorkspaceResultSummary,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
         let source = temp.join("source");
         fs::create_dir_all(&source).expect("source");
         for (name, bytes) in seed {
@@ -1241,8 +1624,7 @@ mod tests {
         let baseline = extract_workspace_snapshot(&archive, &target, &metadata).expect("extract");
         mutate(&target);
         let bundle = temp.join("result.tar.gz");
-        let summary =
-            create_workspace_result_bundle(&target, &baseline, &bundle).expect("bundle");
+        let summary = create_workspace_result_bundle(&target, &baseline, &bundle).expect("bundle");
         // A second extraction stands in for the controller's own copy of S0.
         let local = temp.join("local");
         extract_workspace_snapshot(&archive, &local, &metadata).expect("extract local");
@@ -1254,7 +1636,11 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let (summary, bundle, local) = snapshot_and_diff(
             temp.path(),
-            &[("keep.txt", b"same"), ("edit.txt", b"before"), ("gone.txt", b"bye")],
+            &[
+                ("keep.txt", b"same"),
+                ("edit.txt", b"before"),
+                ("gone.txt", b"bye"),
+            ],
             |target| {
                 fs::write(target.join("edit.txt"), b"after").expect("edit");
                 fs::remove_file(target.join("gone.txt")).expect("delete");
@@ -1262,13 +1648,16 @@ mod tests {
             },
         );
 
-        let outcome = apply_workspace_result_bundle(&bundle, &local, &summary, false)
-            .expect("apply");
+        let outcome =
+            apply_workspace_result_bundle(&bundle, &local, &summary, false).expect("apply");
         assert!(!outcome.aborted, "an untouched local tree has no conflicts");
         assert!(outcome.conflicts.is_empty());
         assert_eq!(fs::read(local.join("edit.txt")).expect("edit"), b"after");
         assert_eq!(fs::read(local.join("new.txt")).expect("new"), b"created");
-        assert!(!local.join("gone.txt").exists(), "deletions must be applied");
+        assert!(
+            !local.join("gone.txt").exists(),
+            "deletions must be applied"
+        );
         assert_eq!(
             fs::read(local.join("keep.txt")).expect("keep"),
             b"same",
@@ -1279,18 +1668,15 @@ mod tests {
     #[test]
     fn a_locally_edited_file_blocks_the_apply_instead_of_being_overwritten() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let (summary, bundle, local) = snapshot_and_diff(
-            temp.path(),
-            &[("shared.txt", b"before")],
-            |target| {
+        let (summary, bundle, local) =
+            snapshot_and_diff(temp.path(), &[("shared.txt", b"before")], |target| {
                 fs::write(target.join("shared.txt"), b"target edit").expect("edit");
-            },
-        );
+            });
         // The user kept working locally while the job ran.
         fs::write(local.join("shared.txt"), b"my local work").expect("local edit");
 
-        let outcome = apply_workspace_result_bundle(&bundle, &local, &summary, false)
-            .expect("apply");
+        let outcome =
+            apply_workspace_result_bundle(&bundle, &local, &summary, false).expect("apply");
         assert!(outcome.aborted, "a conflict must stop the apply");
         assert_eq!(
             outcome.conflicts,
@@ -1310,25 +1696,27 @@ mod tests {
         let forced =
             apply_workspace_result_bundle(&bundle, &local, &summary, true).expect("forced apply");
         assert!(!forced.aborted);
-        assert_eq!(fs::read(local.join("shared.txt")).expect("local"), b"target edit");
+        assert_eq!(
+            fs::read(local.join("shared.txt")).expect("local"),
+            b"target edit"
+        );
     }
 
     #[test]
     fn a_tampered_bundle_is_rejected_before_anything_is_written() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let (summary, bundle, local) = snapshot_and_diff(
-            temp.path(),
-            &[("a.txt", b"before")],
-            |target| {
+        let (summary, bundle, local) =
+            snapshot_and_diff(temp.path(), &[("a.txt", b"before")], |target| {
                 fs::write(target.join("a.txt"), b"after").expect("edit");
-            },
-        );
+            });
         fs::write(&bundle, b"not the bundle you verified").expect("tamper");
 
         let error = apply_workspace_result_bundle(&bundle, &local, &summary, false)
             .expect_err("a tampered bundle must be refused");
         assert!(
-            error.to_string().contains("does not match the reported digest"),
+            error
+                .to_string()
+                .contains("does not match the reported digest"),
             "{error}"
         );
         assert_eq!(fs::read(local.join("a.txt")).expect("local"), b"before");

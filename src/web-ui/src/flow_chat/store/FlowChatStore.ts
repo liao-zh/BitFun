@@ -2146,6 +2146,56 @@ export class FlowChatStore {
     });
   }
 
+  /** Update the target-owned model choice before an observer job is submitted. */
+  public updateSessionDispatchModel(sessionId: string, modelName: string): void {
+    this.setState(prev => {
+      const session = prev.sessions.get(sessionId);
+      const normalizedModelName = modelName.trim();
+      if (
+        !session
+        || !normalizedModelName
+        || session.config.dispatchModel === normalizedModelName
+      ) {
+        return prev;
+      }
+
+      const newSessions = new Map(prev.sessions);
+      newSessions.set(sessionId, {
+        ...session,
+        config: {
+          ...session.config,
+          dispatchModel: normalizedModelName,
+        },
+        lastActiveAt: Date.now(),
+      });
+      return { ...prev, sessions: newSessions };
+    });
+  }
+
+  /** Update the immutable-at-submit approval policy while the job is still local. */
+  public updateSessionDispatchApprovalPolicy(
+    sessionId: string,
+    approvalPolicy: NonNullable<SessionConfig['dispatchApprovalPolicy']>,
+  ): void {
+    this.setState(prev => {
+      const session = prev.sessions.get(sessionId);
+      if (!session || session.config.dispatchApprovalPolicy === approvalPolicy) {
+        return prev;
+      }
+
+      const newSessions = new Map(prev.sessions);
+      newSessions.set(sessionId, {
+        ...session,
+        config: {
+          ...session.config,
+          dispatchApprovalPolicy: approvalPolicy,
+        },
+        lastActiveAt: Date.now(),
+      });
+      return { ...prev, sessions: newSessions };
+    });
+  }
+
   /**
    * Apply a backend session rebind (worktree isolation toggled on or off).
    * The project root stays put; only the execution directory moves.
@@ -2195,8 +2245,13 @@ export class FlowChatStore {
       target: NonNullable<SessionConfig['dispatchTarget']>;
       jobId: string;
       approvalPolicy: NonNullable<SessionConfig['dispatchApprovalPolicy']>;
+      model?: string;
+      availableModels?: string[];
+      defaultModel?: string;
       state?: NonNullable<SessionConfig['dispatchJobState']>;
       cursor?: number;
+      sourceWorkspacePath?: string;
+      sourceWorkspaceId?: string;
     },
   ): void {
     this.setState(prev => {
@@ -2218,14 +2273,30 @@ export class FlowChatStore {
       }
 
       const newSessions = new Map(prev.sessions);
+      const sourceWorkspacePath = binding.sourceWorkspacePath?.trim() || undefined;
+      const sourceWorkspaceId = binding.sourceWorkspaceId?.trim() || undefined;
       newSessions.set(sessionId, {
         ...session,
+        workspacePath: sourceWorkspacePath ?? session.workspacePath,
+        projectWorkspacePath:
+          sourceWorkspacePath ?? session.projectWorkspacePath,
+        workspaceId: sourceWorkspaceId ?? session.workspaceId,
         config: {
           ...session.config,
+          workspacePath:
+            sourceWorkspacePath ?? session.config.workspacePath,
+          projectWorkspacePath:
+            sourceWorkspacePath ?? session.config.projectWorkspacePath,
+          workspaceId: sourceWorkspaceId ?? session.config.workspaceId,
           dispatchTargetRequest: binding.targetRequest,
           dispatchTarget: binding.target,
           dispatchJobId: binding.jobId,
           dispatchApprovalPolicy: binding.approvalPolicy,
+          dispatchModel: binding.model ?? session.config.dispatchModel,
+          dispatchAvailableModels:
+            binding.availableModels ?? session.config.dispatchAvailableModels,
+          dispatchDefaultModel:
+            binding.defaultModel ?? session.config.dispatchDefaultModel,
           dispatchJobState: binding.state ?? session.config.dispatchJobState ?? 'queued',
           dispatchCursor: Math.max(0, binding.cursor ?? session.config.dispatchCursor ?? 0),
         },

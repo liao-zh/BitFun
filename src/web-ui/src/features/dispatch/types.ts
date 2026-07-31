@@ -22,6 +22,10 @@ export type DispatchApprovalPolicy = 'auto' | 'reject-and-report' | 'remote';
 export type DispatchWorkspaceDeliveryRequest =
   | { kind: 'existing' }
   | {
+      kind: 'snapshot-source';
+      sourceWorkspacePath: string;
+    }
+  | {
       kind: 'snapshot-exact';
       sourceWorkspacePath: string;
       sensitiveFilesConfirmed: true;
@@ -223,6 +227,9 @@ export interface OutboundDispatchRecord {
   jobId: string;
   target: DispatchTarget;
   sessionId: string;
+  /** Controller workspace that owns the observer session. */
+  sourceWorkspacePath?: string;
+  sourceWorkspaceId?: string;
   workspacePath: string;
   promptPreview: string;
   title?: string;
@@ -241,6 +248,8 @@ export interface DispatchSelection {
   workspaceDelivery: DispatchWorkspaceDeliveryRequest;
   approvalPolicy: DispatchApprovalPolicy;
   model?: string;
+  availableModels?: string[];
+  defaultModel?: string;
 }
 
 export function isNonLocalDispatchTarget(
